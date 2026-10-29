@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Split DDS setup for the Go2:
+    Domain 0  -> Go2 / robot side, wired (enP8p1s0). Go2 firmware is fixed to domain 0.
+    Domain 18 -> high-level side, wifi (wlP1p1s0). domain_bridge copies topics 0 -> 18.
+-->
+<CycloneDDS xmlns="https://cdds.io" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain Id="0">
+        <General>
+            <Interfaces>
+                <NetworkInterface name="enP8p1s0" />
+            </Interfaces>
+            <DontRoute>true</DontRoute>
+            <MaxMessageSize>65500B</MaxMessageSize>
+        </General>
+        <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <MaxAutoParticipantIndex>100</MaxAutoParticipantIndex>
+        </Discovery>
+        <Internal>
+            <SocketReceiveBufferSize max="10MB" />
+            <Watermarks>
+                <WhcHigh>500kB</WhcHigh>
+            </Watermarks>
+        </Internal>
+    </Domain>
+    <Domain Id="18">
+        <General>
+            <Interfaces>
+                <NetworkInterface name="wlP1p1s0" />
+            </Interfaces>
+            <!-- multicast for discovery only, user data goes unicast -->
+            <AllowMulticast>spdp</AllowMulticast>
+            <MaxMessageSize>65500B</MaxMessageSize>
+        </General>
+        <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <MaxAutoParticipantIndex>100</MaxAutoParticipantIndex>
+        </Discovery>
+        <Internal>
+            <SocketReceiveBufferSize max="10MB" />
+            <Watermarks>
+                <WhcHigh>500kB</WhcHigh>
+            </Watermarks>
+        </Internal>
+    </Domain>
+</CycloneDDS>

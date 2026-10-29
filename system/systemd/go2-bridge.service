@@ -1,0 +1,18 @@
+[Unit]
+Description=Go2 domain bridge (domain 0 eth -> domain 18 wifi)
+After=go2-driver.service
+
+[Service]
+ExecStart=/home/racecar/dds/go2_run.sh bridge
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/racecar/dds/logs/go2-bridge.log
+StandardError=inherit
+KillSignal=SIGINT
+# SIGINT only to ros2 launch, which forwards it; the default sends it to every
+# node as well, and the second SIGINT interrupts their cleanup.
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,1 @@
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="imu", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"

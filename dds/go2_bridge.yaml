@@ -1,0 +1,134 @@
+# domain_bridge: Go2 / robot side (domain 0, eth) -> high-level side (domain 18, wifi)
+# Generated from `ros2 topic list -t` on domain 0. Comment out topics to save bandwidth.
+name: go2_bridge
+from_domain: 0
+to_domain: 18
+topics:
+  api/arm/request: {type: unitree_api/msg/Request}
+  api/assistant_recorder/request: {type: unitree_api/msg/Request}
+  api/assistant_recorder/response: {type: unitree_api/msg/Response}
+  api/audiohub/request: {type: unitree_api/msg/Request}
+  api/audiohub/response: {type: unitree_api/msg/Response}
+  api/bashrunner/request: {type: unitree_api/msg/Request}
+  api/bashrunner/response: {type: unitree_api/msg/Response}
+  api/config/request: {type: unitree_api/msg/Request}
+  api/config/response: {type: unitree_api/msg/Response}
+  api/fourg_agent/request: {type: unitree_api/msg/Request}
+  api/fourg_agent/response: {type: unitree_api/msg/Response}
+  api/gas_sensor/request: {type: unitree_api/msg/Request}
+  api/gas_sensor/response: {type: unitree_api/msg/Response}
+  api/gesture/request: {type: unitree_api/msg/Request}
+  api/gpt/request: {type: unitree_api/msg/Request}
+  api/gpt/response: {type: unitree_api/msg/Response}
+  api/motion_switcher/request: {type: unitree_api/msg/Request}
+  api/motion_switcher/response: {type: unitree_api/msg/Response}
+  api/obstacles_avoid/request: {type: unitree_api/msg/Request}
+  api/obstacles_avoid/response: {type: unitree_api/msg/Response}
+  api/pet/request: {type: unitree_api/msg/Request}
+  api/pet/response: {type: unitree_api/msg/Response}
+  api/programming_actuator/request: {type: unitree_api/msg/Request}
+  api/programming_actuator/response: {type: unitree_api/msg/Response}
+  api/rm_con/request: {type: unitree_api/msg/Request}
+  api/robot_state/request: {type: unitree_api/msg/Request}
+  api/robot_state/response: {type: unitree_api/msg/Response}
+  api/slam_operate/request: {type: unitree_api/msg/Request}
+  api/slam_operate/response: {type: unitree_api/msg/Response}
+  api/sport/request: {type: unitree_api/msg/Request}
+  api/sport/response: {type: unitree_api/msg/Response}
+  api/sport_lease/request: {type: unitree_api/msg/Request}
+  api/sport_lease/response: {type: unitree_api/msg/Response}
+  api/uwbswitch/request: {type: unitree_api/msg/Request}
+  api/uwbswitch/response: {type: unitree_api/msg/Response}
+  api/videohub/request: {type: unitree_api/msg/Request}
+  api/videohub/response: {type: unitree_api/msg/Response}
+  api/voice/request: {type: unitree_api/msg/Request}
+  api/voice/response: {type: unitree_api/msg/Response}
+  api/vui/request: {type: unitree_api/msg/Request}
+  api/vui/response: {type: unitree_api/msg/Response}
+  arm/action/state: {type: std_msgs/msg/String}
+  # arm_Command: {type: unitree_arm/msg/ArmString}   # type not built on this Jetson
+  # arm_Feedback: {type: unitree_arm/msg/ArmString}   # type not built on this Jetson
+  audio_msg: {type: std_msgs/msg/String}
+  audiohub/player/state: {type: std_msgs/msg/String}
+  audioreceiver: {type: unitree_go/msg/AudioData}
+  audiosender: {type: unitree_go/msg/AudioData}
+  cmd_vel: {type: geometry_msgs/msg/Twist, reversed: true}   # wifi -> robot
+  # config_change_status: {type: unitree_go/msg/ConfigChangeStatus}   # type not built on this Jetson
+  # frontvideostream: {type: unitree_go/msg/Go2FrontVideoData}   # disabled: use go2_camera topics instead
+  gas_sensor: {type: std_msgs/msg/String}
+  gesture/result: {type: std_msgs/msg/String}
+  gnss: {type: std_msgs/msg/String}
+  gpt_cmd: {type: std_msgs/msg/String}
+  gpt_state: {type: std_msgs/msg/String}
+  gptflowfeedback: {type: std_msgs/msg/String}
+  imu: {type: unitree_go/msg/IMUState}
+  joint_states: {type: sensor_msgs/msg/JointState}
+  lf/battery_alarm: {type: std_msgs/msg/String}
+  # lf/lowstate: {type: unitree_go/msg/LowState}   # disabled: not needed over wifi
+  lf/sportmodestate: {type: unitree_go/msg/SportModeState}
+  lio_sam_ros2/mapping/odometry: {type: nav_msgs/msg/Odometry}
+  lowcmd: {type: unitree_go/msg/LowCmd}
+  # lowstate: {type: unitree_go/msg/LowState}   # disabled: 500 Hz, too heavy for wifi
+  multiplestate: {type: std_msgs/msg/String}
+  odom: {type: nav_msgs/msg/Odometry}
+  # pctoimage_local: {type: unitree_interfaces/msg/PcToImage}   # type not built on this Jetson
+  pet/flowfeedback: {type: std_msgs/msg/String}
+  pointcloud: {type: sensor_msgs/msg/PointCloud2}
+  programming_actuator/command: {type: std_msgs/msg/String}
+  programming_actuator/feedback: {type: std_msgs/msg/String}
+  public_network_status: {type: std_msgs/msg/String}
+  # qt_add_edge: {type: unitree_interfaces/msg/QtEdge}   # type not built on this Jetson
+  # qt_add_node: {type: unitree_interfaces/msg/QtNode}   # type not built on this Jetson
+  # qt_command: {type: unitree_interfaces/msg/QtCommand}   # type not built on this Jetson
+  qt_notice: {type: std_msgs/msg/String}
+  # query_result_edge: {type: unitree_interfaces/msg/QtEdge}   # type not built on this Jetson
+  # query_result_node: {type: unitree_interfaces/msg/QtNode}   # type not built on this Jetson
+  robot_description: {type: std_msgs/msg/String, qos: {durability: transient_local, reliability: reliable}}
+  rtc/state: {type: std_msgs/msg/String}
+  rtc_status: {type: std_msgs/msg/String}
+  scan: {type: sensor_msgs/msg/LaserScan}
+  selftest: {type: std_msgs/msg/String}
+  servicestate: {type: std_msgs/msg/String}
+  servicestateactivate: {type: std_msgs/msg/String}
+  slam_info: {type: std_msgs/msg/String}
+  slam_key_info: {type: std_msgs/msg/String}
+  sportmodestate: {type: unitree_go/msg/SportModeState}
+  tf: {type: tf2_msgs/msg/TFMessage}
+  tf_static: {type: tf2_msgs/msg/TFMessage, qos: {durability: transient_local, reliability: reliable}}
+  uslam/client_command: {type: std_msgs/msg/String}
+  uslam/cloud_map: {type: sensor_msgs/msg/PointCloud2}
+  uslam/frontend/cloud_world_ds: {type: sensor_msgs/msg/PointCloud2}
+  uslam/frontend/odom: {type: nav_msgs/msg/Odometry}
+  uslam/localization/cloud_world: {type: sensor_msgs/msg/PointCloud2}
+  uslam/localization/odom: {type: nav_msgs/msg/Odometry}
+  uslam/map_file_pub: {type: sensor_msgs/msg/PointCloud2}
+  uslam/map_file_sub: {type: sensor_msgs/msg/PointCloud2}
+  uslam/navigation/global_path: {type: sensor_msgs/msg/PointCloud2}
+  uslam/server_log: {type: std_msgs/msg/String}
+  utlidar/client_command: {type: std_msgs/msg/String}
+  utlidar/cloud: {type: sensor_msgs/msg/PointCloud2}
+  utlidar/cloud_base: {type: sensor_msgs/msg/PointCloud2}
+  utlidar/cloud_deskewed: {type: sensor_msgs/msg/PointCloud2}
+  utlidar/grid_map: {type: sensor_msgs/msg/PointCloud2}
+  utlidar/height_map: {type: sensor_msgs/msg/PointCloud2}
+  utlidar/height_map_array: {type: unitree_go/msg/HeightMap}
+  utlidar/imu: {type: sensor_msgs/msg/Imu}
+  utlidar/lidar_state: {type: unitree_go/msg/LidarState}
+  utlidar/mapping_cmd: {type: std_msgs/msg/String}
+  utlidar/range_info: {type: geometry_msgs/msg/PointStamped}
+  utlidar/range_map: {type: sensor_msgs/msg/PointCloud2}
+  utlidar/robot_odom: {type: nav_msgs/msg/Odometry}
+  utlidar/robot_pose: {type: geometry_msgs/msg/PoseStamped}
+  utlidar/server_log: {type: std_msgs/msg/String}
+  utlidar/switch: {type: std_msgs/msg/String}
+  utlidar/voxel_map: {type: sensor_msgs/msg/PointCloud2}
+  utlidar/voxel_map_compressed: {type: unitree_go/msg/VoxelMapCompressed}
+  uwbstate: {type: unitree_go/msg/UwbState}
+  uwbswitch: {type: unitree_go/msg/UwbSwitch}
+  videohub/inner: {type: std_msgs/msg/String}
+  webrtcreq: {type: std_msgs/msg/String}
+  webrtcres: {type: std_msgs/msg/String}
+  wirelesscontroller: {type: unitree_go/msg/WirelessController}
+  wirelesscontroller_unprocessed: {type: unitree_go/msg/WirelessController}
+  xfk_webrtcreq: {type: std_msgs/msg/String}
+  xfk_webrtcres: {type: std_msgs/msg/String}

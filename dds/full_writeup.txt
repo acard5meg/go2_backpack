@@ -1,0 +1,956 @@
+================================================================================
+ UNITREE GO2 + JETSON: FULL SYSTEM WRITE-UP
+ Networking, ROS 2 / CycloneDDS, Go2 driver, front camera, GPS, IMU, startup, debugging
+ Last updated: 2026-10-28
+================================================================================
+
+This file describes everything that runs on the Jetson mounted on the Go2: what each
+piece does, why it is set up that way, which problems came up while building it and
+how each was fixed, how to debug it, and what to do next.
+
+The shorter reference is ~/dds/README.md. This file is the long version.
+
+CONTENTS
+  1.  The big picture
+  2.  Hardware and network addresses
+  3.  Network layer (Ethernet, Wi-Fi, kernel settings)
+  4.  CycloneDDS configuration
+  5.  ROS 2 domains and the domain bridge
+  6.  The Go2 driver stack
+  7.  Front camera node
+  7b. GPS node
+  7c. IMU node
+  8.  Startup on boot (systemd user services)
+  9.  Shell environment and aliases
+  10. Setting up a remote computer (laptop / RViz)
+  11. File inventory
+  12. Problems encountered and how they were solved
+  13. Debugging guide (with commands)
+  14. Measured baselines (what "normal" looks like)
+  15. To do / next steps
+
+
+================================================================================
+1. THE BIG PICTURE
+================================================================================
+
+  Go2 main board 192.168.123.161 --+
+  Go2 dock       192.168.123.18  --+-- Ethernet (enP8p1s0, 192.168.123.99, 1 Gbit/s)
+                                   |   DDS domain 0  +  camera H.264/RTP multicast
+            +-------------------- JETSON --+-----------------------------------+
+            | DOMAIN 0 (Ethernet only)                                         |
+            |   Go2 firmware topics (/lowstate, /utlidar/*, /api/*, ...)       |
+            |   go2_driver, robot_state_publisher, pointcloud_to_laserscan     |
+            |          |                                                       |
+            |          |  domain_bridge (~/dds/go2_bridge.yaml)                |
+            |          v  116 topics 0 -> 18, cmd_vel 18 -> 0                  |
+            | DOMAIN 18 (Wi-Fi only)                                           |
+            |   bridged topics, go2_camera (front camera images),              |
+            |   go2_gps (/fix from the GPS on UART /dev/ttyTHS1),              |
+            |   go2_imu (/imu/data, /imu/mag from the USB IMU /dev/imu),       |
+            |   any high-level nodes you run yourself                          |
+            +-------------------------------+----------------------------------+
+                                            | Wi-Fi (wlP1p1s0, 192.168.0.253, 5 GHz)
+                                            | DDS domain 18: multicast discovery,
+                                            | unicast data
+                                    laptops / RViz (domain 18)
+
+Core ideas:
+  - The Go2 firmware always talks DDS on domain 0. That cannot be changed, so domain 0
+    is the robot side, and it is pinned to the Ethernet port.
+  - Everything else (your own nodes, laptops, RViz) lives on domain 18, pinned to Wi-Fi.
+  - The two domains never see each other directly. A domain_bridge process on the
+    Jetson copies chosen topics from 0 to 18 (and cmd_vel from 18 to 0).
+  - Heavy, fast robot traffic (/lowstate at 500 Hz, raw video, clouds) therefore can't
+    leak onto Wi-Fi unless it is bridged AND a remote computer subscribes to it.
+  - If Wi-Fi drops, domain 0 keeps running untouched.
+  - Shells default to domain 18, so a stray `ros2 topic pub` can't command the robot
+    directly.
+
+
+================================================================================
+2. HARDWARE AND NETWORK ADDRESSES
+================================================================================
+
+  Jetson            NVIDIA Jetson, L4T R36.4.3 (JetPack 6), 6 CPU cores, aarch64
+  ROS               ROS 2 Humble, RMW = rmw_cyclonedds_cpp
+  User              racecar
+
+  Interface   Name        Address            Connects to
+  ---------   ---------   ----------------   -------------------------------------
+  Ethernet    enP8p1s0    192.168.123.99/24  Go2 main board .161, Go2 dock .18
+  Wi-Fi       wlP1p1s0    192.168.0.253/24   Router TP-Link_A4CC (gw 192.168.0.1)
+                                             Laptop last seen at 192.168.0.32
+
+  UART        ttyTHS1     115200 8N1         HGLRC M100 mini GPS (u-blox M10)
+  USB (CH340) ttyUSB0     115200 8N1         WitMotion WT901 IMU, udev name /dev/imu
+
+  Ethernet negotiates 1000 Mbit/s full duplex.
+  Wi-Fi is locked to 5 GHz (see 3.2).
+
+
+================================================================================
+3. NETWORK LAYER
+================================================================================
+
+3.1 Ethernet (to the Go2)
+  - Static 192.168.123.99/24 on enP8p1s0. The Go2 network is 192.168.123.0/24.
+  - Carries DDS domain 0 (all Go2 topics) and the Go2's front-camera video, which is
+    an H.264/RTP stream multicast to 230.1.1.1:1720. It is NOT DDS.
+  - Point-to-point link, so multicast is fine here and the Go2 expects it.
+
+3.2 Wi-Fi (to the rest of the world)
+  - Network "TP-Link_A4CC" (NetworkManager connection of the same name).
+  - LOCKED TO 5 GHz: `802-11-wireless.band = a` (set 2026-10-28). The router uses the
+    same network name on 2.4 and 5 GHz, and the Jetson had drifted to 2.4 GHz, which
+    was 2-10x slower (see section 12).
+  - Wi-Fi power save is off.
+  - Current link: 5 GHz ch. 153, about -56 dBm, RX ~526-585 Mbit/s on 2 antenna
+    streams, TX 87.8 Mbit/s on ONE stream. The weak transmit side is the known
+    bottleneck, since the Jetson sends almost all the data (see section 15).
+
+3.3 Kernel socket buffer
+  - /etc/sysctl.d/60-cyclonedds.conf contains:  net.core.rmem_max=10485760
+  - Lets Cyclone use a 10 MB receive buffer. The default (~212 KB) dropped big
+    messages such as raw 2.7 MB camera frames and large point clouds.
+  - Applied at every boot. Check with:  sysctl net.core.rmem_max
+
+
+================================================================================
+4. CYCLONEDDS CONFIGURATION  (~/dds/cyclonedds.xml)
+================================================================================
+
+One XML file with one <Domain> block per domain ID. Cyclone picks the block that
+matches each participant's domain ID, so a single CYCLONEDDS_URI works for every
+process, including domain_bridge, which opens both domains in one process.
+
+  Domain 0 (Go2 side)
+    NetworkInterface     enP8p1s0 only
+    DontRoute            true (never route through a gateway)
+    Multicast            default (on). Point-to-point link; the Go2 expects it.
+    MaxMessageSize       65500B
+    SocketReceiveBuffer  max="10MB"
+    WhcHigh              500kB (writer history cache watermark)
+    ParticipantIndex     auto, up to 100 participants
+
+  Domain 18 (Wi-Fi side)
+    NetworkInterface     wlP1p1s0 only
+    AllowMulticast       spdp  -> multicast is used ONLY for discovery
+    MaxMessageSize       65500B
+    SocketReceiveBuffer  max="10MB"
+    WhcHigh              500kB
+    ParticipantIndex     auto, up to 100 participants
+
+Why AllowMulticast=spdp on Wi-Fi:
+  - Discovery by multicast means any laptop that joins domain 18 finds the Jetson
+    automatically, with no IP list to maintain when new people connect.
+  - Data still goes unicast, only to the machines that subscribed. Full multicast
+    would broadcast a point cloud to every device on the Wi-Fi, at the router's
+    lowest multicast rate, which slows everyone down.
+  - If a router ever blocks multicast, discovery fails. The fallback is a static peer
+    list:  <Discovery><Peers><Peer Address="192.168.0.x"/></Peers></Discovery>
+
+Why max= and not min= on SocketReceiveBufferSize:
+  - min= makes Cyclone REFUSE TO START if the kernel won't give it that much.
+  - max= asks for 10 MB and carries on with less. See section 12.
+
+~/dds/cyclonedds_laptop.xml is the same domain 18 block on its own, for remote
+computers, with the interface name left as CHANGE_ME_wifi_iface.
+
+
+================================================================================
+5. ROS 2 DOMAINS AND THE DOMAIN BRIDGE  (~/dds/go2_bridge.yaml)
+================================================================================
+
+5.1 What the bridge does
+  - Package: ros-humble-domain-bridge 0.5.0. Runs as the go2-bridge service.
+  - from_domain 0, to_domain 18. One line per topic, with its message type and, where
+    needed, QoS.
+  - 116 topics are active, and 12 are commented out (see 5.3).
+  - The list was generated from `ros2 topic list -t` on domain 0, with the driver's
+    topics added by hand.
+
+5.2 Special entries
+  - cmd_vel: {reversed: true}. Goes the other way, Wi-Fi -> robot, so a laptop can
+    drive the robot through the driver. To command anything else from Wi-Fi (e.g.
+    api/sport/request), add reversed: true. NEVER list one topic in both directions,
+    or messages loop forever.
+  - tf_static and robot_description use durability transient_local + reliable
+    ("latched"), so RViz still gets them when it starts after they were published.
+
+5.3 Not bridged, on purpose
+  - /lowstate          500 Hz full robot state. Far too heavy for Wi-Fi.
+  - /lf/lowstate       20 Hz copy of the same. Not needed remotely.
+  - /frontvideostream  Carried no data. The camera comes from go2_camera instead.
+  - 9 topics whose message types aren't built on this Jetson:
+      arm_Command, arm_Feedback                (unitree_arm/ArmString)
+      config_change_status                     (unitree_go/ConfigChangeStatus)
+      pctoimage_local                          (unitree_interfaces/PcToImage)
+      qt_add_edge, qt_add_node, qt_command,
+      query_result_edge, query_result_node     (unitree_interfaces/Qt*)
+    The bridge needs every message type it carries. To bridge these, the packages
+    must be built on the Jetson AND on the remote computer.
+  - /rosout and /parameter_events: each domain has its own.
+
+5.4 How the bridge behaves
+  - It creates the bridge for a topic only once a publisher exists, because it copies
+    the publisher's QoS. Topics nobody publishes (most /api/*/request) don't appear
+    on domain 18 until something publishes them.
+  - It subscribes to EVERY listed topic on domain 0 all the time, whether or not
+    anyone is watching. Cost: ~50-55% of one CPU core on the Jetson.
+  - On Wi-Fi, though, DDS only sends a topic to remote subscribers that matched it.
+    With nobody connected, Wi-Fi carries only ~3 KB/s of discovery traffic.
+
+5.5 Topic cost over Wi-Fi when a remote computer subscribes (measured)
+    /go2_video_frames/compressed   ~1.6 MB/s  (JPEG q80, 14 fps)
+    /utlidar/cloud_deskewed        ~1.0 MB/s  (heaviest cloud)
+    /joint_states                  ~190 KB/s  (500 Hz of tiny packets, which is worse
+                                              for Wi-Fi than the bytes suggest)
+    /pointcloud, /utlidar/cloud    ~170-190 KB/s each (same cloud twice)
+    /tf                            ~90 Hz after the fix (was ~519 Hz / 583 KB/s)
+    /scan                          ~6 KB/s
+    /go2_video_frames (raw)        ~40 MB/s. NEVER view this over Wi-Fi.
+
+
+================================================================================
+6. THE GO2 DRIVER STACK  (domain 0, go2-driver service)
+================================================================================
+
+Started by:  ros2 launch go2_bringup go2.launch.py   (ROS_DOMAIN_ID=0)
+Workspace:   ~/go2_ws  (sources in ~/go2_ws/src)
+
+6.1 Processes launched
+  a) robot_state_publisher  (from go2_description/launch/robot.launch.py)
+     - Loads urdf/go2_description.urdf and publishes /robot_description (latched).
+     - Turns /joint_states into /tf for the 12 leg joints, capped at
+       publish_frequency = 100 Hz. With use_sim_time=False this measures ~90 Hz.
+  b) go2_container (rclcpp_components) holding the go2_driver::Go2Driver component
+     - Subscribes:
+         /lowstate            -> publishes /joint_states (once per lowstate, ~500 Hz)
+         /utlidar/cloud       -> republishes as /pointcloud, frame "radar"
+         /utlidar/robot_pose  -> publishes /odom and TF odom -> base_link (~19 Hz,
+                                 z +0.07 m)
+         /cmd_vel             -> sends a Unitree sport "Move" request with x, y, yaw
+                                 rate on /api/sport/request
+         /joy                 -> joystick handling
+     - Publishes: /joint_states, /pointcloud, /odom, /imu (unitree_go/IMUState),
+                  /api/sport/request, /tf (odom -> base_link)
+     - Services (go2_interfaces): body height, continuous gait, euler, foot raise
+       height, mode, pose, speed level, switch gait, switch joystick
+  c) pointcloud_to_laserscan
+     - /pointcloud -> /scan (target_frame "radar")
+  d) Optional launch args lidar / realsense / rviz all default to False. The Hesai
+     lidar and Realsense includes are commented out in go2.launch.py.
+
+6.2 TF tree (main frames)
+    odom -> base_link   (go2_driver, from the Go2's own pose estimate)
+    base_link -> base_body -> legs, Head_upper, radar, ...  (robot_state_publisher)
+  Use "odom" or "base_link" as the RViz fixed frame.
+
+6.3 Local modifications to the driver packages (uncommitted, keep in mind)
+  - go2_description/launch/robot.launch.py line 52: use_sim_time default 'True' ->
+    'False'. THE /tf FLOOD FIX (section 12).
+  - go2_description/urdf/go2_description.urdf: added an empty base_link with a fixed
+    joint to base_body. This was there before this work.
+  - go2_driver/src/go2_driver/go2_driver.cpp: `odom_published_ = true;` commented out,
+    so odom keeps publishing instead of once. This was there before this work.
+  - go2_bringup/launch/go2.launch.py: Hesai lidar and Realsense includes commented out
+    (packages not installed). This was there before this work.
+
+6.4 Safety note about cmd_vel
+  - The driver forwards each cmd_vel as a Move request. It has NO timeout of its own.
+  - cmd_vel can come from Wi-Fi through the bridge. If Wi-Fi drops while a laptop is
+    sending velocity, the robot does whatever the Go2 firmware does when Move requests
+    stop arriving. This hasn't been tested here. See section 15.
+
+6.5 How /odom is produced
+    Go2 firmware --/utlidar/robot_pose (PoseStamped, ~19 Hz, domain 0)--> go2_driver
+      go2_driver::publish_pose_stamped()  (go2_driver.cpp:138-169), per message:
+        -> TF odom -> base_link: same pose, z + 0.07 m (hard-coded height offset)
+        -> /odom (nav_msgs/Odometry): same pose, z + 0.07 m, stamped with the
+           Jetson's now(), QoS reliable + transient_local
+      -> domain_bridge -> /odom on domain 18 (~19 Hz)
+  - The pose is the Go2's own lidar (L1) + IMU estimate, already in an "odom" frame.
+  - twist is always zero and there is no covariance: pose only.
+  - Upstream publishes /odom ONCE (odom_published_ = true after the first message).
+    The local edit commenting that line out (go2_driver.cpp:167) is what makes it
+    continuous. Resetting / pulling the package brings back the one-shot behaviour.
+  - Faster sources on domain 0: /utlidar/robot_odom (Odometry, ~150 Hz, same lidar
+    system) and /sportmodestate (~300 Hz, Go2 controller state incl. leg-odometry
+    velocity).
+
+
+================================================================================
+7. FRONT CAMERA NODE  (~/go2_ws/src/go2_camera, package go2_camera, go2-camera service)
+================================================================================
+
+  - Lives in the workspace at ~/go2_ws/src/go2_camera. Its own git repo (origin
+    github.com/acard5meg/go2_front_camera_feed). Moved there from ~/go2_front_camera_feed
+    on 2026-10-28; it used to be a symlink.
+  - Reads the Go2's H.264/RTP multicast (230.1.1.1:1720) on enP8p1s0 with GStreamer
+    through OpenCV. Decodes with the Jetson hardware decoder (nvv4l2decoder) by default;
+    decoder:=sw uses avdec_h264 on the CPU.
+  - Publishes DIRECTLY on domain 18. The video is UDP, not DDS, so there is nothing
+    to bridge, and the bridge doesn't have to copy 2.7 MB frames.
+
+  Topic (domain 18)              Type                        Use
+  -----------------------------  --------------------------  ----------------------
+  /go2_video_frames              sensor_msgs/Image 1280x720  On the Jetson only.
+                                 bgr8, ~2.7 MB per frame     ~40 MB/s.
+  /go2_video_frames/compressed   sensor_msgs/CompressedImage Remote viewing.
+                                 JPEG                        14.3 fps, ~1.6 MB/s.
+
+  - Each topic is only converted and published while it has a subscriber. Decoding
+    always runs: ~18-30% of a core when idle, ~45% while publishing JPEG.
+  - frame_id = Head_upper (the URDF has no camera link). No camera_info is published.
+  - Parameters: multicast_iface (enP8p1s0), decoder (hw|sw), multicast_address, port,
+    frame_id, jpeg_quality (80).
+  - Changes made to the node: interface was hard-coded to eth0 (doesn't exist here),
+    now a parameter; the 10 Hz timer replaced by a reader thread (full ~15 fps); added
+    the compressed topic; publishing only with subscribers; hardware decoding; fixed
+    rclpy.spin being called twice, which broke Ctrl+C.
+  - The repo has uncommitted changes (camera_node.py, launch, package.xml, README).
+  - Rebuild after code changes:
+      cd ~/go2_ws && colcon build --symlink-install --packages-select go2_camera
+      systemctl --user restart go2-camera
+  - RViz: use an IMAGE display on /go2_video_frames/compressed. A CAMERA display warns
+    "no camera_info received", because it needs intrinsics we don't publish.
+
+
+================================================================================
+7b. GPS NODE  (~/go2_ws/src/go2_gps, package go2_gps, go2-gps service)
+================================================================================
+
+  Receiver   HGLRC M100 mini (u-blox M10), multi-constellation (GPS, Galileo, BeiDou,
+             QZSS seen in its output)
+  Port       /dev/ttyTHS1, 115200 baud 8N1. There is no ttyTHS0 on this Jetson.
+             ttyTHS2 and ttyS0 are unused. racecar is in dialout, so no sudo.
+  Output     NMEA sentences (GGA, RMC, GSA, VTG, GSV) at 10 Hz, mixed with binary UBX.
+
+  Topic (domain 18)   Type                   Rate    frame_id
+  -----------------   --------------------   -----   --------
+  /fix                sensor_msgs/NavSatFix  10 Hz   gps
+
+  How the node works (go2_gps/gps_node.py):
+  - A reader thread opens the port, reads whatever bytes are waiting in chunks, and
+    splits them into lines. (pyserial's readline() reads one byte per call, which
+    wastes CPU.) If the port can't be opened or errors, it retries every 2 s. It warns
+    if no data arrives for 5 s.
+  - Each line: drop anything before '$', verify the *XX checksum, split the fields.
+    UBX junk and corrupt sentences are skipped.
+  - GSA: VDOP and the constellations in use (NMEA 4.10 system ID: 1 GPS, 2 GLONASS,
+    3 Galileo, 4 BeiDou) -> NavSatStatus.service. This receiver sends GSA after GGA,
+    so each fix uses the previous epoch's GSA.
+  - GGA: one /fix per GGA.
+      quality 0 -> STATUS_NO_FIX, lat/lon/alt NaN, covariance type UNKNOWN
+      quality 1 -> STATUS_FIX, 2 -> SBAS_FIX, 4/5 (RTK) -> GBAS_FIX, 6 (DR) -> FIX
+      lat/lon: ddmm.mmmm + hemisphere -> signed decimal degrees
+      altitude: MSL altitude + geoid separation = WGS84 ellipsoid height
+      covariance (APPROXIMATED): east/north = (HDOP*s)^2, up = (VDOP*s)^2, with
+      s = 4 m standalone, 1 m SBAS, 0.5 m RTK float, 0.02 m RTK fixed
+  - It publishes even without a fix, so subscribers can tell the receiver is alive.
+    "Fix acquired" / "No fix" are logged when the state changes.
+  - Shutdown: stops the thread, and calls destroy_node() only if the ROS context is
+    still valid (on Humble it raises after SIGINT), then rclpy.try_shutdown().
+  - The launch file (launch/gps.launch.py, args port, baud, frame_id) also starts a
+    static_transform_publisher base_link -> gps at ZERO offset. Set the real antenna
+    position there once the mount is measured.
+  - Published straight on domain 18 (like the camera). The data isn't from the Go2's
+    DDS, so there's nothing to bridge.
+
+  Tested:
+  - Live on the receiver: 10 Hz, NO_FIX indoors (0 satellites visible).
+  - With synthetic NMEA through a virtual serial port: a fix at 38.8325 N, 77.3083 W
+    gave the correct lat/lon, altitude 120 m MSL - 33 m geoid = 87 m, and covariance
+    12.96 / 12.96 / 36 m^2.
+  - TF chain odom -> base_link -> gps resolves on domain 18.
+  - CPU about 5% of one core.
+
+  Rebuild after code changes:
+    cd ~/go2_ws && colcon build --symlink-install --packages-select go2_gps
+    systemctl --user restart go2-gps
+
+
+================================================================================
+7c. IMU NODE  (~/go2_ws/src/go2_imu, package go2_imu, go2-imu service)
+================================================================================
+
+  Sensor     WitMotion WT901 9-axis IMU (accel, gyro, magnetometer + onboard fusion),
+             with a CH340 USB-serial chip built in (USB 1a86:7523) and an on/off switch.
+  Port       /dev/imu -> /dev/ttyUSB0, 115200 baud. Named by
+             /etc/udev/rules.d/99-witmotion-imu.rules:
+               SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523",
+               SYMLINK+="imu", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
+             (matches ANY CH340; add the USB port path if a second CH340 is ever added)
+
+  Topic (domain 18)   Type                       Rate     frame_id
+  -----------------   ------------------------   ------   --------
+  /imu/data           sensor_msgs/Imu            100 Hz   imu_link
+  /imu/mag            sensor_msgs/MagneticField  100 Hz   imu_link (RAW COUNTS)
+  (Different from the Go2's own /imu, unitree_go/IMUState, bridged from domain 0.)
+
+  IMU settings, stored in its flash (changed 2026-10-28):
+    register         was                     now
+    RSW   (0x02)     0x001E acc/gyro/ang/mag 0x021E + quaternion
+    RRATE (0x03)     0x0D  no auto output    0x09  100 Hz
+    BAUD  (0x04)     0x06  115200            unchanged
+  Commands: FF AA <reg> <lo> <hi>. Unlock first with FF AA 69 88 B5, save with
+  FF AA 00 00 00. Read registers with FF AA 27 <reg> 00 (reply is a 0x55 0x5F packet).
+  RRATE values: 0x06 10 Hz, 0x07 20, 0x08 50, 0x09 100, 0x0B 200, 0x0C single, 0x0D off.
+
+  How the node works (go2_imu/imu_node.py):
+  - Same reader-thread / chunked-read / reopen-on-error design as the GPS node. Warns
+    if nothing arrives for 2 s (usually means RRATE is off again).
+  - Packet sync: 0x55, a type byte 0x50-0x5F, 8 data bytes (4 int16 LE), checksum = low
+    byte of the sum of the first 10. Bad or misaligned bytes are skipped one at a time.
+  - Scaling: accel x 16 g / 32768 -> m/s^2 (gravity included, +9.81 on z when level);
+    gyro x 2000 deg/s / 32768 -> rad/s; quaternion / 32768, sent as w,x,y,z (checked
+    against the Euler angles); Euler x 180 deg / 32768 (used only if quaternion output
+    is turned off).
+  - One Imu message per cycle, when the quaternion (last packet in the cycle) arrives.
+  - Magnetometer published in raw counts (mag_scale = 1.0). Set mag_scale (T/count)
+    after calibrating. Yaw comes from the WT901's own fusion and isn't true north until
+    the magnetometer is calibrated.
+  - Covariance diagonals from parameters: orientation 0.01/0.01/0.035 rad, gyro 0.002
+    rad/s, accel 0.04 m/s^2 (rough datasheet figures).
+  - Launch file also starts a static base_link -> imu_link transform (zero offset and
+    rotation). Set the real mount there.
+  - Tested: 100 Hz on both topics, |accel| = 9.81 m/s^2 at rest, orientation matches the
+    IMU's Euler output, TF chain odom -> imu_link resolves, clean restarts, ~14% of one
+    core (mostly rclpy publishing 200 messages/s).
+
+
+================================================================================
+8. STARTUP ON BOOT  (systemd user services)
+================================================================================
+
+  Service      Runs                                              Log
+  -----------  ------------------------------------------------  -------------------------
+  go2-driver   go2_run.sh driver -> go2_bringup go2.launch.py   ~/dds/logs/go2-driver.log
+               on domain 0
+  go2-bridge   go2_run.sh bridge -> domain_bridge with           ~/dds/logs/go2-bridge.log
+               go2_bridge.yaml (After=go2-driver)
+  go2-camera   go2_run.sh camera -> go2_camera                   ~/dds/logs/go2-camera.log
+               camera_feed.launch.py on domain 18
+  go2-gps      go2_run.sh gps -> go2_gps gps.launch.py           ~/dds/logs/go2-gps.log
+               on domain 18
+  go2-imu      go2_run.sh imu -> go2_imu imu.launch.py           ~/dds/logs/go2-imu.log
+               on domain 18
+
+  - Unit files: ~/.config/systemd/user/go2-*.service, WantedBy=default.target.
+  - Restart=always, RestartSec=5. A crash or failed start retries every 5 s.
+  - KillSignal=SIGINT + KillMode=mixed: SIGINT goes only to ros2 launch, which shuts
+    its nodes down in order. Anything still running after 15 s gets SIGKILL.
+  - ~/dds/go2_run.sh sets the ROS environment itself. The services do NOT read
+    ~/.bashrc, so change paths in go2_run.sh too.
+  - go2_run.sh waits until the needed interfaces have an IPv4 address: enP8p1s0 for
+    the driver, both interfaces for the bridge and the camera, wlP1p1s0 for the GPS and IMU. Cyclone can't create a
+    domain on an interface with no address.
+  - Linger is enabled (`loginctl show-user racecar -p Linger` -> Linger=yes), so the
+    services start at boot without anyone logging in.
+  - Output goes to log files because `journalctl --user` keeps nothing on this Jetson.
+  - The log files are appended forever and never rotated.
+
+
+================================================================================
+9. SHELL ENVIRONMENT AND ALIASES  (~/.bashrc lines ~131-144)
+================================================================================
+
+  source /opt/ros/humble/setup.bash
+  source ~/go2_ws/install/setup.bash
+  export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+  export CYCLONEDDS_URI="file://$HOME/dds/cyclonedds.xml"
+  export ROS_DOMAIN_ID=18
+
+  go2_dom      switch this shell to domain 0 (Go2 side)
+  wifi_dom     switch this shell back to domain 18
+  launch_go    run the driver stack by hand on domain 0
+  go2_bridge   run the domain bridge by hand
+  go2_cam      run the camera node by hand on domain 18
+  go2_gps      run the GPS node by hand on domain 18
+  go2_imu      run the IMU node by hand on domain 18
+  ros2_go      source ~/go2_ws/install/setup.bash
+  unitree_setup  Unitree's setup script, now pointing at ~/dds/cyclonedds.xml
+
+  Backups: ~/.bashrc.bak.2026-10-28, ~/unitree_ros2/setup.sh.bak.2026-10-28
+  The old single-domain config ~/unitree_ros2/cyclonedds.xml is no longer used.
+
+
+================================================================================
+10. SETTING UP A REMOTE COMPUTER (LAPTOP / RVIZ)
+================================================================================
+
+  1. Copy ~/dds/cyclonedds_laptop.xml to the laptop. Replace CHANGE_ME_wifi_iface with
+     its Wi-Fi interface (find it with `ip -br addr`).
+  2. Environment (add to the laptop's ~/.bashrc):
+       export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+       export ROS_DOMAIN_ID=18
+       export CYCLONEDDS_URI=file:///path/to/cyclonedds_laptop.xml
+     Requires: sudo apt install ros-humble-rmw-cyclonedds-cpp
+  3. Build from ~/go2_ws/src on the laptop:
+       go2_description         RViz loads meshes from package:// paths locally
+       unitree_go, unitree_api to see the Unitree message types
+  4. sudo apt install ros-humble-image-transport-plugins   (compressed images)
+  5. RViz:
+       Fixed Frame   odom (or base_link)
+       RobotModel    Description Source = Topic, /robot_description
+       TF            on
+       Image         /go2_video_frames/compressed (NOT a Camera display)
+       PointCloud2   /pointcloud or /utlidar/cloud, Reliability = Best Effort
+       LaserScan     /scan, Reliability = Best Effort
+  6. Any number of laptops can join. Nothing on the Jetson needs to change.
+
+
+================================================================================
+11. FILE INVENTORY
+================================================================================
+
+  ~/dds/cyclonedds.xml                     Jetson Cyclone config (domains 0 and 18)
+  ~/dds/cyclonedds_laptop.xml              Remote computer template (domain 18)
+  ~/dds/go2_bridge.yaml                    Bridge topic list and QoS
+  ~/dds/go2_run.sh                         Launcher used by the services
+  ~/dds/logs/go2-{driver,bridge,camera,gps,imu}.log  Service output
+  ~/dds/README.md                          Short reference
+  ~/dds/full_writeup.txt                   This file
+  ~/.config/systemd/user/go2-driver.service
+  ~/.config/systemd/user/go2-bridge.service
+  ~/.config/systemd/user/go2-camera.service
+  ~/go2_ws/src/go2_camera/                 Camera package (git repo, origin
+                                           github.com/acard5meg/go2_front_camera_feed)
+  ~/go2_ws/src/go2_gps/                    GPS package (not under git yet)
+  ~/go2_ws/src/go2_imu/                    IMU package (not under git yet)
+  ~/.config/systemd/user/go2-imu.service
+  /etc/udev/rules.d/99-witmotion-imu.rules  IMU -> /dev/imu, ModemManager ignore
+  ~/.config/systemd/user/go2-gps.service
+  ~/go2_ws/src/go2_{bringup,driver,description,interfaces,robot,rviz}, unitree_api,
+    unitree_go                             Driver workspace
+  ~/.bashrc                                Environment and aliases
+  ~/unitree_ros2/setup.sh                  Unitree setup, now uses ~/dds/cyclonedds.xml
+  /etc/sysctl.d/60-cyclonedds.conf         net.core.rmem_max = 10 MB
+  NetworkManager connection TP-Link_A4CC   band locked to 5 GHz ("a")
+
+  Everything is versioned in ~/go2_backpack (GitHub acard5meg/go2_backpack):
+  ~/go2_ws and ~/dds are symlinks into it, and system/ holds copies of the systemd
+  units, udev rule, sysctl file and bashrc block. install.sh sets it all up on a new
+  Jetson. The original nested .git folders are in ~/go2_backpack_git_backup/.
+
+
+================================================================================
+12. PROBLEMS ENCOUNTERED AND HOW THEY WERE SOLVED
+================================================================================
+
+P1. All Go2 traffic could leak onto Wi-Fi
+    Symptom : The original ~/unitree_ros2/cyclonedds.xml used one "any" domain block on
+              both interfaces, with everything on domain 0. Any laptop subscription
+              pulled 500 Hz robot data over Wi-Fi.
+    Fix     : Two-domain split (0 = Ethernet, 18 = Wi-Fi) in one XML, plus
+              domain_bridge. Updated ~/unitree_ros2/setup.sh and ~/.bashrc to use it.
+
+P2. Keeping track of peer IPs whenever someone new connects
+    Symptom : A static peer list would need editing for every new laptop.
+    Fix     : AllowMulticast=spdp on domain 18: multicast discovery, unicast data.
+
+P3. Cyclone refused to start ("failed to increase socket receive buffer size",
+    "failed to create domain")
+    Cause   : SocketReceiveBufferSize min="10MB" while the kernel limit was ~212 KB.
+    Fix     : Changed to max="10MB", and later raised net.core.rmem_max to 10 MB in
+              /etc/sysctl.d/60-cyclonedds.conf.
+
+P4. Bridge crashed with YAML::ParserException
+    Cause   : A comment was placed inside the { } of a topic entry.
+    Fix     : Comments go AFTER the closing }, never inside it.
+
+P5. /odom, /imu, /pointcloud missing on domain 18
+    Cause   : The driver wasn't running when the topic list was generated, and those
+              three were missed when its topics were added by hand.
+    Fix     : Added to go2_bridge.yaml.
+
+P6. Services must survive reboots and come up before anyone logs in
+    Fix     : systemd user services, Restart=always, go2_run.sh waits for interface
+              IPs, `sudo loginctl enable-linger racecar`.
+    Gotcha  : sudo in a non-interactive shell can't prompt for a password. Run sudo
+              commands in a real terminal.
+
+P7. journalctl --user showed nothing
+    Cause   : No persistent user journal on this Jetson.
+    Fix     : The services append to ~/dds/logs/*.log.
+
+P8. Camera node never received video
+    Cause   : The multicast interface was hard-coded to eth0, which doesn't exist here.
+              /frontvideostream (DDS) carried no data.
+    Fix     : Interface parameter (default enP8p1s0); read the RTP multicast directly.
+
+P9. Camera capped at ~10 fps, Ctrl+C didn't stop it
+    Cause   : 10 Hz timer; rclpy.spin was called twice.
+    Fix     : Reader thread; single spin.
+
+P10. Raw /go2_video_frames barely came through
+    Cause   : 2.7 MB messages overflowed the ~212 KB kernel socket buffer.
+    Fix     : net.core.rmem_max = 10 MB (P3). Now 14.3 fps.
+
+P11. Wi-Fi ping 275-400 ms whenever RViz was open (the /tf flood)
+    Cause   : robot_state_publisher was launched with use_sim_time=True on a real
+              robot. With no /clock, its rate cap never applied, so it published TF
+              for every 500 Hz /joint_states message: ~519 Hz, 583 KB/s of tiny
+              packets.
+    Fix     : go2_description/launch/robot.launch.py line 52: use_sim_time default
+              -> 'False'. /tf now ~90 Hz. Ping dropped to 2-20 ms.
+
+P12. Bridge CPU too high, /lowstate not needed remotely
+    Fix     : Unbridged /lowstate, /lf/lowstate, /frontvideostream. Bridge went from
+              ~65% to ~54% of one core.
+
+P13. RViz warning "no camera_info received"
+    Cause   : A Camera display was used. It needs camera_info, which isn't published.
+    Fix     : Use an Image display. (Publishing camera_info is a to-do, section 15.)
+
+P14. Wi-Fi drifted from 5 GHz to 2.4 GHz (TX 39 Mbit/s instead of 87.8)
+    Cause   : Same network name on both bands and no band set on the connection, so
+              it picked the stronger (but slower) 2.4 GHz radio.
+    Fix     : nmcli connection modify TP-Link_A4CC 802-11-wireless.band a
+              nmcli connection up TP-Link_A4CC
+              systemctl --user restart go2-bridge go2-camera
+              (Worked without sudo from the local desktop session.)
+
+P16. Python nodes printed a traceback on every service stop/restart
+    Cause   : systemd's default KillMode=control-group sends SIGINT to every process in
+              the service, and ros2 launch forwards SIGINT too. Each node got two SIGINTs,
+              and the second interrupted its cleanup (KeyboardInterrupt in
+              destroy_node / thread join). It affected go2-camera too.
+    Fix     : KillMode=mixed in all unit files. GPS node: destroy_node() only if
+              the context is valid, then rclpy.try_shutdown().
+
+P17. GPS: no ttyTHS0, and which baud rate?
+    Fix     : Probed ttyTHS1/ttyTHS2/ttyS0 at 9600-230400 baud and looked for NMEA.
+              Found on ttyTHS1 @ 115200.
+
+P18. Ethernet to the Go2 dropped (cable / Go2 off, ~17:49 on 2026-10-28)
+    Symptom : driver log flooded with "ddsi_udp_conn_write ... failed with retcode -1";
+              no /tf, /odom or /lowstate.
+    Fix     : Plug it back in. Domain 0 recovered BY ITSELF within seconds (/lowstate
+              500 Hz, /tf ~108 Hz on both domains). No service restart needed.
+
+P19. IMU: CH340 detected but /dev/ttyUSB0 disappeared immediately
+    Cause   : brltty (braille display support, installed by default on Ubuntu) has a
+              udev rule for 1a86:7523 and grabbed the device ("USB interface in use:
+              0 (ch341)" ... "converter now disconnected from ttyUSB0").
+    Fix     : sudo apt remove brltty; udev rule 99-witmotion-imu.rules (/dev/imu,
+              dialout, ModemManager ignore); replug.
+
+P20. IMU silent at every baud rate
+    Cause   : Its output rate register was RRATE = 0x0D (no automatic output). It only
+              answered when sent a command (found with the read-register command
+              FF AA 27 34 00 at 115200).
+    Fix     : Unlock, RSW = 0x021E (add quaternion), RRATE = 0x09 (100 Hz), save.
+
+P21. Laptop could see /imu/data but echo got nothing (while /odom kept working)
+    Cause   : One-way discovery. The Jetson's multicast SPDP reached the laptop, but the
+              laptop's never reached the Jetson (a 35 s listen on 239.255.0.1:11900
+              heard only the Jetson). A publisher only sends to readers it has
+              discovered, so new participants (the IMU node, a fresh echo) got
+              nothing. Already-established sessions (e.g. RViz <-> bridge for /odom)
+              stay alive on unicast traffic, so they kept working.
+    Fix     : Jetson IP as a unicast peer in the laptop XML (cyclonedds_laptop.xml now
+              has it). Jetson config unchanged.
+
+P15. Domain 18 nodes don't recover after Wi-Fi drops
+    Cause   : Cyclone participants bound to an interface that disappeared.
+    Fix     : For now, restart them by hand: systemctl --user restart go2-bridge
+              go2-camera. A permanent fix is in section 15.
+
+
+================================================================================
+13. DEBUGGING GUIDE (WITH COMMANDS)
+================================================================================
+
+Work from the bottom up: link -> IP -> DDS discovery -> topic -> data rate -> RViz.
+
+13.1 Are the services running?
+  systemctl --user status go2-driver go2-bridge go2-camera go2-gps go2-imu
+  systemctl --user is-active go2-driver go2-bridge go2-camera go2-gps go2-imu
+  tail -n 50 ~/dds/logs/go2-driver.log         # likewise go2-bridge.log, go2-camera.log
+  tail -f ~/dds/logs/go2-bridge.log            # follow live
+  loginctl show-user racecar -p Linger         # must be Linger=yes for boot start
+  ps -eo pid,%cpu,rss,args --sort=-%cpu | grep -E "domain_bridge|camera_node|component_container|robot_state|pointcloud_to"
+
+  Restart / stop / run by hand:
+  systemctl --user restart go2-bridge
+  systemctl --user stop go2-driver go2-bridge go2-camera go2-gps go2-imu   # before running by hand
+  launch_go      # terminal 1
+  go2_bridge     # terminal 2
+  go2_cam        # terminal 3
+  systemctl --user start go2-driver go2-bridge go2-camera go2-gps go2-imu  # back to services
+  After editing a unit file:  systemctl --user daemon-reload
+
+13.2 Network links
+  ip -br addr                                  # both interfaces UP with IPs?
+  ip route                                     # default route via wlP1p1s0
+  cat /sys/class/net/enP8p1s0/speed            # expect 1000
+  ping -c 3 192.168.123.161                    # Go2 main board
+  ping -c 3 192.168.0.1                        # Wi-Fi router
+  ping -c 3 <laptop-ip>                        # laptop
+  ip neigh show dev wlP1p1s0                   # FAILED = host not answering ARP
+
+  Wi-Fi quality:
+  iw dev wlP1p1s0 link                         # freq (5xxx = 5 GHz), signal, tx/rx bitrate
+  iw dev wlP1p1s0 get power_save               # should be off
+  nmcli -g 802-11-wireless.band connection show TP-Link_A4CC   # expect "a"
+  nmcli dev wifi list                          # nearby networks / channel crowding
+
+  Real throughput (start "iperf3 -s" on the laptop first):
+  iperf3 -c <laptop-ip>                        # Jetson -> laptop (the direction that matters)
+  iperf3 -c <laptop-ip> -R                     # laptop -> Jetson
+
+  Live Wi-Fi transmit rate over 10 s:
+  r(){ awk -v i=$1 '$1==i":"{print $10}' /proc/net/dev; }
+  a=$(r wlP1p1s0); sleep 10; echo "$(( ($(r wlP1p1s0)-a)/10240 )) KB/s"
+
+13.3 DDS / environment
+  echo $RMW_IMPLEMENTATION $ROS_DOMAIN_ID $CYCLONEDDS_URI
+  sysctl net.core.rmem_max                     # expect 10485760
+  ros2 daemon stop; ros2 daemon start          # if topic lists look stale
+  ROS_DOMAIN_ID=0  ros2 topic list | wc -l     # Go2 side, ~120
+  ROS_DOMAIN_ID=18 ros2 topic list | wc -l     # Wi-Fi side, ~99 with everything up
+  ros2 doctor --report | less                  # general ROS sanity
+  Verbose Cyclone logging for one command (very noisy):
+  CYCLONEDDS_URI="$CYCLONEDDS_URI,<Tracing><Verbosity>config</Verbosity><OutputFile>/tmp/cdds.log</OutputFile></Tracing>" ros2 topic list
+
+  Multicast check (domain 18 discovery). tcpdump is not installed yet:
+  sudo apt install tcpdump
+  Discovery port = 7400 + 250 * domain  -> domain 0 = 7400, domain 18 = 11900
+  sudo tcpdump -i wlP1p1s0 -n udp port 11900   # should see SPDP packets every few s
+  sudo tcpdump -i enP8p1s0 -n udp port 7400    # Go2 side discovery
+
+13.4 A topic is missing or slow
+  ROS_DOMAIN_ID=0  ros2 topic info -v /topic   # publisher exists on the Go2 side?
+  grep -n "topic_name" ~/dds/go2_bridge.yaml   # listed and not commented out?
+  ROS_DOMAIN_ID=18 ros2 topic info -v /topic   # bridged? check QoS of both sides
+  ROS_DOMAIN_ID=18 ros2 topic hz /topic        # rate
+  ROS_DOMAIN_ID=18 ros2 topic bw /topic        # bandwidth
+  ROS_DOMAIN_ID=18 ros2 topic echo /topic --once
+
+  QoS mismatch (subscriber silently gets nothing): compare "Reliability" and
+  "Durability" in `ros2 topic info -v`. A Reliable subscriber won't match a
+  Best Effort publisher. A transient_local subscriber won't match a volatile publisher.
+
+13.5 TF / robot model
+  ros2 run tf2_ros tf2_echo odom base_link     # transform exists and updates?
+  ros2 run tf2_tools view_frames               # writes frames.pdf with the full tree
+  ros2 topic hz /tf                            # expect ~90-110 Hz, NOT ~500
+  ros2 param get /robot_state_publisher use_sim_time   (on domain 0) -> False
+  ROS_DOMAIN_ID=18 ros2 topic echo /robot_description --once --qos-durability transient_local | head
+  No model on the laptop: go2_description not built/sourced there (mesh errors in RViz).
+
+13.6 Camera
+  tail -n 40 ~/dds/logs/go2-camera.log         # shows the GStreamer pipeline it opened
+  ROS_DOMAIN_ID=18 ros2 topic hz /go2_video_frames/compressed   # expect ~14 fps
+  Is video arriving on the wire at all?
+  sudo tcpdump -i enP8p1s0 -n host 230.1.1.1 -c 20
+  Test the stream without ROS:
+  gst-launch-1.0 udpsrc address=230.1.1.1 port=1720 multicast-iface=enP8p1s0 ! \
+      application/x-rtp,media=video,encoding-name=H264 ! rtph264depay ! h264parse ! \
+      nvv4l2decoder ! fakesink -v
+  View on the laptop: ros2 run rqt_image_view rqt_image_view
+
+13.6b GPS
+  tail -n 20 ~/dds/logs/go2-gps.log            # "Opened /dev/ttyTHS1", fix changes
+  ros2 topic hz /fix                           # expect ~10 Hz
+  ros2 topic echo /fix --once                  # status -1 = no fix, 0+ = fix
+  ros2 run tf2_ros tf2_echo base_link gps
+  Raw receiver output (stop go2-gps first, or the two readers steal bytes from each
+  other):
+  systemctl --user stop go2-gps
+  stty -F /dev/ttyTHS1 115200 raw -echo && cat /dev/ttyTHS1 | grep -a -E 'GGA|GSV'
+  systemctl --user start go2-gps
+  GGA field 7 = fix quality (0 none), field 8 = satellites in use. GSV field 4 =
+  satellites in view. 00 in view = no sky view (indoors) or interference.
+  Find the port and baud if it ever moves:
+  for b in 9600 38400 115200; do stty -F /dev/ttyTHS1 $b raw -echo; \
+    timeout 2 cat /dev/ttyTHS1 | grep -a -m1 '\$G' && echo "baud $b"; done
+
+13.6c IMU
+  ls -l /dev/imu                               # -> ttyUSB0
+  lsusb | grep 1a86:7523                       # CH340 present
+  journalctl -k | grep -iE "ch341|brltty"      # driver attach / something stealing it
+  tail -n 20 ~/dds/logs/go2-imu.log
+  ros2 topic hz /imu/data                      # ~100 Hz
+  ros2 topic echo /imu/data --once             # accel z ~ +9.81 when level
+  Raw bytes (stop go2-imu first): should be full of 55 51 / 55 52 / 55 53 ...
+  systemctl --user stop go2-imu
+  python3 -c "import serial;print(serial.Serial('/dev/imu',115200,timeout=1).read(66).hex(' '))"
+  systemctl --user start go2-imu
+
+13.7 Driver / commanding the robot
+  ROS_DOMAIN_ID=0 ros2 topic hz /lowstate      # ~500 Hz = Go2 is talking
+  ROS_DOMAIN_ID=0 ros2 topic echo /api/sport/request   # what the driver sends
+  ROS_DOMAIN_ID=0 ros2 service list | grep -i go2      # driver services
+  Small test move (robot must be standing, clear area). Ctrl+C to stop:
+  ROS_DOMAIN_ID=18 ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1}}"
+
+13.8 After Wi-Fi changes or drops
+  systemctl --user restart go2-bridge go2-camera
+
+13.9 Common symptom -> likely cause
+  Laptop sees no topics       wrong ROS_DOMAIN_ID / RMW / interface name in the laptop
+                              XML; router blocks multicast (add Peers); firewall on
+                              the laptop (allow UDP 7400-12000)
+  Topics listed, no data      QoS mismatch; Wi-Fi dropped and the bridge needs a restart
+  Laggy RViz, high ping       /tf rate back to ~500 Hz; heavy displays
+                              (cloud_deskewed, raw video); Wi-Fi on 2.4 GHz
+  Bridge won't start          YAML syntax (comment inside { }); a message type not
+                              built; see go2-bridge.log
+  Nothing after reboot        Linger off; interface without IP (log shows "waiting
+                              for ..."); workspace not built
+  Cyclone "failed to create domain"  interface name wrong / no IP; min= on buffer
+  No /dev/imu                 brltty reinstalled; udev rule missing; IMU switched off
+  /imu/data silent            IMU RRATE off (0x0D); another process holds /dev/imu
+  /fix always NO_FIX          no sky view; interference from USB 3.0 / Go2 electronics;
+                              cold start needs minutes outdoors
+  No /fix at all              go2-gps not running; wiring (GPS TX -> Jetson RX);
+                              another process holding /dev/ttyTHS1
+  Driver log "conn_write failed"  Ethernet to the Go2 down (ip -br link)
+
+
+================================================================================
+14. MEASURED BASELINES (2026-10-28)
+================================================================================
+
+  Wi-Fi link (5 GHz ch. 153)  signal -56 dBm, RX 526-585 Mbit/s (2 streams),
+                              TX 87.8 Mbit/s (1 stream)
+  Wi-Fi on 2.4 GHz (bad)      TX 39 Mbit/s, RX 58.5 Mbit/s
+  Ethernet                    1000 Mbit/s full duplex
+  Ping Jetson -> laptop       2-20 ms (avg 8) after the /tf fix; 275-400 ms before
+  Ping Jetson -> router       3-45 ms
+  Idle Wi-Fi traffic          ~3 KB/s (discovery only)
+  /lowstate (domain 0)        ~500 Hz
+  /tf leg transforms          ~90 Hz;   odom -> base_link ~19 Hz
+  /utlidar/cloud              ~14.7 Hz
+  Camera                      14.3 fps raw and compressed
+  GPS /fix                    10 Hz, gps_node ~5% of one core
+  IMU /imu/data, /imu/mag     100 Hz each, imu_node ~14% of one core
+  Topics                      ~120 on domain 0, ~99 on domain 18
+  CPU (% of one core, 6 cores total)
+    domain_bridge ~50-55, component_container (driver) ~22, camera_node ~18-45,
+    robot_state_publisher ~12, pointcloud_to_laserscan ~6
+
+
+================================================================================
+15. TO DO / NEXT STEPS
+================================================================================
+
+15.1 NETWORKING (ranked by impact)
+  [ ] 1. Fix the weak Wi-Fi uplink. TX is on 1 antenna stream (87.8 Mbit/s) while RX
+         uses 2. Check both antenna leads on the Wi-Fi card and move the antennas
+         outside any metal / up high. Or use a USB 5 GHz adapter on a mast.
+         Verify with `iw dev wlP1p1s0 link`: TX should show NSS 2.
+  [ ] 2. Router: give the 5 GHz radio its own network name (e.g. "Go2_5G"), pick a
+         channel nobody else uses (`nmcli dev wifi list`), and ideally use a dedicated
+         router for the robot.
+  [ ] 3. Measure real throughput with iperf3 (laptop `iperf3 -s`, Jetson
+         `iperf3 -c <laptop>`) before and after each change.
+  [ ] 4. Remove MaxMessageSize 65500B from the domain 18 block (and the laptop XML).
+         64 KB datagrams split into ~45 IP fragments, and losing one resends all 64 KB.
+         Cyclone's default (~14.7 KB) handles loss much better. Keep 65500B on domain 0.
+  [ ] 5. RViz habits: Best Effort for clouds and scans; /pointcloud or /scan instead
+         of /utlidar/cloud_deskewed; never raw video; no /joint_states displays.
+  [ ] 6. Cheaper camera: jpeg_quality 50, plus new options for an fps cap and
+         downscaling (e.g. 640x360 @ 10 fps). That cuts ~1.6 MB/s by 4-8x.
+  [ ] 7. Throttled copies for remote use (topic_tools is already installed), e.g. a
+         5 Hz cloud:
+         ros2 run topic_tools throttle messages /utlidar/cloud 5.0 /utlidar/cloud_5hz
+  [ ] 8. Consider throttling /joint_states in the driver to ~50 Hz (a parameter).
+         /tf would follow, and there would be fewer tiny packets everywhere.
+  [ ] 9. Trim the bridge list to topics actually used remotely (unused /utlidar/*
+         maps, /audio*, /gpt*, /qt_*, /api/*/response). Saves bridge CPU.
+  [x] 10. Laptop-side Cyclone Peers entry for the Jetson (done, needed on this router).
+  [ ] 11. Reserve 192.168.0.253 for the Jetson in the router's DHCP, since every
+          laptop config now points at it. Check the router's IGMP snooping /
+          multicast settings if more devices join.
+
+15.2 ROBUSTNESS
+  [ ] SAFETY: add a cmd_vel watchdog on domain 0. If no cmd_vel arrives for ~0.5 s,
+      send zero velocity / StopMove. Options: a timeout in go2_driver's
+      cmd_vel_callback plus a timer, or twist_mux with a timeout in front of the
+      driver. First test what the Go2 firmware does when Move requests stop.
+  [ ] Recover automatically from Wi-Fi drops: a NetworkManager dispatcher script
+      (/etc/NetworkManager/dispatcher.d/) that runs
+      `systemctl --user -M racecar@ restart go2-bridge go2-camera` when wlP1p1s0
+      comes up. Or a small health-check timer that restarts them when domain 18 goes
+      quiet.
+  [ ] Bind go2-bridge to the driver lifecycle (BindsTo/PartOf=go2-driver) if the
+      bridge should restart together with the driver.
+  [ ] Log rotation: logrotate config or a size cap for ~/dds/logs/*.log, or make the
+      user journal persistent (Storage=persistent in journald.conf) and switch to
+      journalctl.
+  [ ] Version control: `git init` in ~/dds and copy the systemd unit files in there.
+      Commit (or fork) the local changes in go2_description, go2_driver, go2_bringup
+      and go2_camera so a rebuild or `git pull` doesn't lose them.
+  [ ] Pin the Wi-Fi to a specific router (BSSID) or a dedicated network name, so the
+      robot can't roam onto another access point.
+  [ ] Static IP or DHCP reservation for the Jetson Wi-Fi (192.168.0.253), so people
+      can always find it.
+  [ ] Time sync: clock is NTP-synced over Wi-Fi now. Without internet, TF timestamps
+      between the Jetson and laptops can drift. Consider chrony with the Jetson as a
+      local time server.
+  [ ] Watch Jetson temperature and throttling under full load (tegrastats).
+  [ ] Test a full cold boot: power-cycle the Go2 and confirm all three services come up
+      with no login, and the laptop sees topics within ~1 minute.
+
+  [ ] GPS: measure the antenna position and set the base_link -> gps offsets in
+      go2_gps/launch/gps.launch.py. Mount the antenna high, sky-facing, away from USB 3.0
+      and the Go2's electronics. Get a first fix outdoors and check /fix against a
+      known point.
+  [ ] GPS: optionally set the receiver to NMEA-only, or enable SBAS, through u-blox
+      config (u-center or UBX-CFG-VALSET). Also consider publishing /vel (from
+      RMC/VTG) and /time_reference.
+  [ ] GPS: for navigation, fuse /fix with odometry using robot_localization
+      (navsat_transform_node + ekf_node).
+  [ ] Commit go2_gps to git along with the rest (see Version control).
+
+  [ ] IMU: measure the mount and set base_link -> imu_link in
+      go2_imu/launch/imu.launch.py (rotation matters as much as position).
+  [ ] IMU: calibrate the magnetometer (WitMotion app, or ROS tools) and set mag_scale,
+      otherwise yaw drifts / isn't north-referenced. Calibrate accel on a level surface.
+  [ ] IMU: if CPU matters, publish fewer messages (e.g. drop /imu/mag or lower RRATE to
+      50 Hz), or rewrite the node in C++.
+  [ ] Fuse /imu/data + Go2 /odom (+ /fix) with robot_localization.
+
+15.3 USABILITY
+  [ ] Laptop setup script: installs packages, writes cyclonedds_laptop.xml with the
+      right interface, sets the env vars, builds go2_description/unitree_go/unitree_api.
+  [ ] Ship a ready RViz config (.rviz) on the laptop with the right displays and QoS
+      (fixed frame odom, RobotModel, TF, Image compressed, PointCloud2 Best Effort,
+      LaserScan).
+  [ ] Publish camera_info and a camera optical frame (Head_upper -> front_camera_optical)
+      so RViz Camera overlays and vision nodes work. Calibrate once with
+      camera_calibration and a checkerboard.
+  [ ] A one-shot health check script (e.g. ~/dds/go2_check.sh) that prints service
+      status, link band and rates, topic counts on both domains, and the /tf, /lowstate
+      and camera rates. Basically section 13 in one command.
+  [ ] Teleop from the laptop: teleop_twist_keyboard or a joystick on domain 18 sends
+      /cmd_vel through the bridge. Do the watchdog item first.
+  [ ] Expose the driver services (mode, body height, gait) on domain 18 if they're
+      needed remotely. domain_bridge supports services in its YAML ("services:").
+  [ ] Bridge the remaining message types (unitree_interfaces, unitree_arm,
+      ConfigChangeStatus) if anyone needs them, by building those packages on the
+      Jetson and the laptops.
+  [ ] Keep README.md and this file updated whenever the config changes.
+
+15.4 ODOMETRY / DRIVER  (see 6.5)
+  [ ] Commit the odom_published_ change (go2_driver.cpp:167), or better, replace the
+      one-shot flag with a proper parameter. Otherwise a reset or upstream pull makes
+      /odom publish a single message and then stop.
+  [ ] Fill in the twist (velocity) in /odom. It is always zero now, so Nav2's
+      controller or robot_localization can't use velocity from it. Source: velocity in
+      /sportmodestate or /utlidar/robot_odom.
+  [ ] Add pose/twist covariance to /odom (currently all zeros = "unknown"), so filters
+      can weight it.
+  [ ] Consider building /odom from /utlidar/robot_odom (~150 Hz, full Odometry) or
+      /sportmodestate (~300 Hz, leg odometry with velocity) instead of
+      /utlidar/robot_pose (~19 Hz, pose only). Keep TF and /odom from the same source.
+  [ ] Make the +0.07 m z offset a parameter and check it against the URDF's base_link
+      height.
+  [ ] Decide on stamps: the driver restamps with the Jetson's now(), which hides the
+      lidar's real latency. Using the Go2 stamp needs the Go2 and Jetson clocks in sync.
+
+================================================================================

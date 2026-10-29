@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Laptop / remote viewer config: only the wifi domain.
+-->
+<CycloneDDS xmlns="https://cdds.io" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain Id="18">
+        <General>
+            <Interfaces>
+                <NetworkInterface name="CHANGE_ME_wifi_iface" />
+            </Interfaces>
+            <!-- multicast for discovery only, user data goes unicast -->
+            <AllowMulticast>spdp</AllowMulticast>
+            <MaxMessageSize>65500B</MaxMessageSize>
+        </General>
+        <Discovery>
+            <!-- Unicast discovery to the Jetson, so this computer is found even when
+                 the network drops its multicast. Reserve this IP for the Jetson. -->
+            <Peers>
+                <Peer Address="192.168.0.253" />
+            </Peers>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <MaxAutoParticipantIndex>100</MaxAutoParticipantIndex>
+        </Discovery>
+        <Internal>
+            <SocketReceiveBufferSize max="10MB" />
+            <Watermarks>
+                <WhcHigh>500kB</WhcHigh>
+            </Watermarks>
+        </Internal>
+    </Domain>
+</CycloneDDS>

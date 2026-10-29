@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>go2_gps</name>
+  <version>0.1.0</version>
+  <description>NMEA GNSS driver for the Go2 Jetson (HGLRC M100 mini), publishes sensor_msgs/NavSatFix on /fix</description>
+  <maintainer email="alexandyrtcard@gmail.com">Alexandyr Card</maintainer>
+  <license>Apache License 2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
